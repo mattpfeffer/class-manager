@@ -1,0 +1,228 @@
+import { readFileSync } from 'fs';
+import { mkdir, writeFile } from 'fs/promises';
+import { dirname, join } from 'path';
+import { glob } from 'glob';
+
+import { debreviate } from '../utils/debreviate.js';
+import type { Declarations, Plugin, PluginOptions, ResolvedConfig } from './types';
+
+/**
+ * Vite plugin that scans source files for `declare` shorthand mappings, expands
+ * them against component defaults and usages, and writes a flat manifest of classes.
+ */
+export function makeManifest(options: PluginOptions = {}): Plugin {
+    const filename = options.filename ?? '.class.manifest';
+
+    let srcDir = options.srcDir;
+    let outDir = options.outDir;
+
+    let extensions: RegExp | RegExp[] = options.extensions ?? /\.html$/;
+
+    return {
+        name: 'class-manager:manifest',
+        apply: 'build',
+        configResolved(config) {
+            const root = config.root ?? process.cwd();
+            srcDir = srcDir ?? join(root, 'src');
+            outDir = outDir ?? root;
+        },
+        async buildStart() {
+            const paths = getPaths(srcDir, extensions);
+
+            const declarations = findDeclarations(paths);
+            const defaults = findDefaults(paths);
+            const props = findProps(paths, declarations);
+
+            const classes = extractClasses(declarations, defaults, props);
+
+            const filePath = join(outDir!, filename);
+            await mkdir(dirname(filePath), { recursive: true });
+
+            await writeFile(filePath, [...classes].join('\n'), 'utf8');
+        }
+    };
+}
+
+/* Helpers */
+
+// Get file paths for matching files.
+function getPaths(dir: string | undefined, ext: RegExp | RegExp[]): string[] {
+    if (!dir) return [];
+    const patterns = Array.isArray(ext) ? ext : [ext];
+
+    const paths = glob.sync(`${dir}/**/*`, { nodir: true });
+    return paths.filter((path) => patterns.some((regex) => regex.test(path)));
+}
+
+// Find declare() object literals and return prefix -> attribute names for each component.
+function findDeclarations(paths: string[]): Map<string, Record<string, string[]>> {
+    const declarations = new Map<string, Record<string, string[]>>();
+    const signature = /declare\(\s*(\{[\s\S]*?\})\s*\)/g;
+
+    paths.forEach((path) => {
+        const data = readFileSync(path, { encoding: 'utf8' });
+
+        const component = getComponentName(path);
+        for (const match of data.matchAll(signature)) {
+            const raw = match[1];
+            if (!raw) continue;
+            const parsed = parseDeclarations(raw);
+            const existing = declarations.get(component) ?? {};
+            Object.entries(parsed).forEach(([prefix, attr]) => {
+                const names = Array.isArray(attr) ? attr : [attr];
+                names.forEach((name) => {
+                    if (!name) return;
+                    const current = existing[prefix] ?? [];
+                    if (!current.includes(name)) current.push(name);
+                    existing[prefix] = current;
+                });
+            });
+            if (Object.keys(existing).length) {
+                declarations.set(component, existing);
+            }
+        }
+    });
+
+    return declarations;
+}
+
+// Best-effort object literal parser for declare() argument.
+function parseDeclarations(raw: string): Declarations {
+    try {
+        // eslint-disable-next-line no-new-func
+        return Function(`"use strict"; return (${raw});`)() as Declarations;
+    } catch {
+        // Fallback: best-effort parse of identifier mappings like { outer: { w: width } }
+        const output: Declarations = {};
+        const topLevel = raw.matchAll(/([A-Za-z_$][\w$]*)\s*:\s*\{([^}]*)\}/g);
+
+        for (const [, target, body] of topLevel) {
+            if (!target || !body) continue;
+            const pairs = body.matchAll(/([A-Za-z_$][\w$]*)\s*:\s*(\[[^\]]+?\]|[A-Za-z_$][\w$]*)/g);
+            for (const [, key, value] of pairs) {
+                if (!key || !value) continue;
+                const entries =
+                    value.startsWith('[') && value.endsWith(']')
+                        ? value
+                              .slice(1, -1)
+                              .split(',')
+                              .map((v) => v.trim())
+                              .filter(Boolean)
+                        : [value];
+
+                entries.forEach((entry) => {
+                    if (!output[key]) {
+                        output[key] = [entry];
+                    } else if (Array.isArray(output[key])) {
+                        if (!(output[key] as string[]).includes(entry)) {
+                            (output[key] as string[]).push(entry);
+                        }
+                    } else if (output[key] !== entry) {
+                        output[key] = [output[key] as string, entry];
+                    }
+                });
+            }
+        }
+
+        return output;
+    }
+}
+
+// Find default prop values (string literals) exported from component files.
+function findDefaults(paths: string[]): Map<string, Record<string, string>> {
+    const defaults = new Map<string, Record<string, string>>();
+
+    paths.forEach((path) => {
+        const data = readFileSync(path, { encoding: 'utf8' });
+        const component = getComponentName(path);
+        const parsed = parseDefaults(data);
+        if (Object.keys(parsed).length) {
+            defaults.set(component, parsed);
+        }
+    });
+
+    return defaults;
+}
+
+// Find shorthand prop usages on component tags and return values keyed by component/attribute.
+function findProps(
+    paths: string[],
+    declarations: Map<string, Record<string, string[]>>
+): Map<string, Record<string, string[]>> {
+    const props = new Map<string, Record<string, string[]>>();
+
+    paths.forEach((path) => {
+        const data = readFileSync(path, { encoding: 'utf8' });
+        declarations.forEach((meta, component) => {
+            Object.values(meta)
+                .flat()
+                .forEach((attrName) => {
+                    if (!attrName) return;
+                    const attrPattern = new RegExp(
+                        `<${component}\\b[^>]*?${attrName}\\s*=\\s*["']([\\w\\s:/-]+)["']`,
+                        'g'
+                    );
+                    for (const match of data.matchAll(attrPattern)) {
+                        const value = match[1];
+                        if (!value) continue;
+                        const record = props.get(component) ?? {};
+                        record[attrName] = [...(record[attrName] ?? []), value];
+                        props.set(component, record);
+                    }
+                });
+        });
+    });
+
+    return props;
+}
+
+// Expand shorthand values into classes using declarations and provided value maps.
+function extractClasses(
+    declarations: Map<string, Record<string, string[]>>,
+    ...sources: Array<Map<string, Record<string, string | string[]>>>
+): Set<string> {
+    const classes = new Set<string>();
+
+    declarations.forEach((meta, component) => {
+        Object.entries(meta).forEach(([prefix, attrs]) => {
+            const attrNames = Array.isArray(attrs) ? attrs : [attrs];
+            attrNames.forEach((attrName) => {
+                sources.forEach((source) => {
+                    const values = source.get(component)?.[attrName];
+                    if (!values) return;
+                    const list = Array.isArray(values) ? values : [values];
+                    list.forEach((val) => {
+                        debreviate(val, prefix).forEach((cls) => classes.add(cls));
+                    });
+                });
+            });
+        });
+    });
+
+    return classes;
+}
+
+// Parse default prop initialisers (string literals).
+function parseDefaults(source: string): Record<string, string> {
+    const defaults: Record<string, string> = {};
+    const pattern =
+        /export\s+(?:let|const)\s+([A-Za-z_$][\w$]*)(?:\s*:\s*[^=]+)?\s*=\s*['"]([^'"]+)['"]/g;
+
+    for (const match of source.matchAll(pattern)) {
+        const [, name, value] = match;
+        if (!name || !value) continue;
+        defaults[name] = value;
+    }
+
+    return defaults;
+}
+
+// Get component name (file stem) from a path.
+function getComponentName(path: string): string {
+    const base = path.split(/[\\/]/).pop() ?? '';
+    const name = base.replace(/\.[^/.]+$/, '');
+    // Astro/Svelte components can be PascalCase; keep original casing.
+    return name;
+}
+
+export default makeManifest;
