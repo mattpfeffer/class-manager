@@ -42,7 +42,14 @@ class ClassManager {
             return prepend ? stripSpaces(`${prepend} ${output}`) : output;
         };
 
-        const props = <T extends string>(...keys: T[]) => this.get(...keys);
+        const props = <T extends string>(...keys: T[]) => {
+            if (keys.length === 1) {
+                const key = keys[0]!;
+                return { [`_${key}`]: this.get(key) as string } as Record<`_${T}`, string>;
+            }
+
+            return this.get(...keys);
+        };
 
         return { slot, props };
     }

@@ -45,4 +45,16 @@ describe('ClassManager', () => {
             _missing: ''
         });
     });
+
+    it('returns a spreadable props object for a single key', () => {
+        const manager = new ClassManager({
+            _button: 'text-stone'
+        });
+
+        const { props } = manager.utils;
+
+        expect(props('button')).toEqual({
+            _button: 'text-stone'
+        });
+    });
 });

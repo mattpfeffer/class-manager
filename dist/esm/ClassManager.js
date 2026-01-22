@@ -25,7 +25,13 @@ class ClassManager {
             const output = this.get(key) ?? fallback;
             return prepend ? stripSpaces(`${prepend} ${output}`) : output;
         };
-        const props = (...keys) => this.get(...keys);
+        const props = (...keys) => {
+            if (keys.length === 1) {
+                const key = keys[0];
+                return { [`_${key}`]: this.get(key) };
+            }
+            return this.get(...keys);
+        };
         return { slot, props };
     }
     /* Helper Methods */
